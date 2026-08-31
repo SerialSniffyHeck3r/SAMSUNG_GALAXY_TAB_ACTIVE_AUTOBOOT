@@ -454,6 +454,8 @@ bootmode_setup
 
 ### 디스어셈블리
 
+Boot.img 파일을 찾았다. 이 안에는 kernel, ramdisk.cpio, dtb 등의 파일이 있다.
+
 Init Wrapper를 디스어셈블리하여 관찰하기로 했다. 
 
 
