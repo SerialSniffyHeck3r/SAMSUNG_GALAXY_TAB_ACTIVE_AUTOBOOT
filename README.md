@@ -555,6 +555,12 @@ ARM64에서 wzr은, 항상 0인 zero register이다. 즉 오리지널 명령은 
 일단 1-3의의 경우, 배터리가 부족할 떄 전원이 켜졌다 꺼졋다를 빠르게 반복하나, 충전기의 성능이 괜찮은 것을 사용할 경우 안정적으로 부팅하여 충전이 가능했다. 나머지는 추후 검증해 나갈 것이지만, 일단 지금까지로써는 Green Flag이다.
 
 
+가장 중요한 주의사항 하나는 lpcharge가 Himax/Wacom 전용 변수가 아니라 Samsung kernel 전체의 LPM policy flag일 것으로 추정하고 있다... 다른 곳에서도 이 문자열이 연속적으로 발견됬던 것 같다. 이것은 확실하지 않지만 본 동작과 구현의 특성을 고려하면 충분히 그렇다고 추론할 수 있다. 따라서 lpcharge=0 강제가 입력장치 말고 배터리/thermal/USB/충전 정책의 다른 코드 경로에도 영향을 줄 수 있기 때문에 장기 안정성 테스트는 그래서 중요한 것이다. 
+
+
+그렇지만 일단 2주동안 별 탈 없이 잘 쓰고는 있다. 
+
+
 ## 롤백
 
 이 프로젝트는 `boot` partition만 수정했다. 따라서 Download Mode와 Odin AP slot으로 기존 boot-only tar를 다시 넣는 rollback 전략이 유지된다. `param`, `up_param`, bootloader, vbmeta는 건드리지 않았다.
