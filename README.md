@@ -257,8 +257,130 @@ normal boot stable; attempt guard cleared
 역시 실제 내 3번쨰 실험에서는 드라이버 중 일부가 전혀 실행되지 않았으며 거기에 터치 드라이버와 와콤 펜 드라이버가 포함되어 있었다. 그러니 터치가 안 되지. 즉 이것을 실사용할 수 있다고 가정할 수 없었다.
 
 
-뭐... 어쨋든 이번 시도로  "일단 Android가 올라오면 되는가?" 라는 중심 질문에 대해서는 'YES' 라는 답을 내놓을 수 있었다. 이후 질문은 "Android가 정상 boot와 같은 hardware driver 상태로 올라오는가"로 바뀌었다.
+뭐... 어쨋든 이번 시도로  "일단 Android가 올라오면 되는가?" 라는 중심 질문에 대해서는 'YES' 라는 답을 내놓을 수 있었다. 이후 질문은 "Android가 정상 boot와 같은 hardware driver 상태로 올라오는가"로 바뀌었다. 
 
 
 
+### Version 4: `sec-charger` 중지 후 `late-init`
 
+
+#### 가설 및 구현
+
+
+여기까지 진행했으면, 일단 본 실험이 이루고자 하는 목표의 50%는 이룬 것이다. 어쨋든 태블릿이 충전기를 꼽았더니 켜졌잖아? 머리가 아프니 일단 밖에 나가서 오토바이를 타고 한 바퀴를 돌고 왔다. 
+
+
+charger session에서 늦게 `late-init`을 호출하지 말고, PID 1이 boot mode를 읽기 전부터 `androidboot.mode=charger`를 `unknown`으로 보이게 하면 Android init이 처음부터 normal boot 쪽으로 갈 수 있을 것이다.
+
+
+내 새로운 가설을 검증하기 위해, Magiskinit의 boot config parsing 단계에 다음 로직을 추가했다.
+
+
+```
+- `/proc/cmdline`을 읽는다.
+- `/proc/bootconfig`를 읽는다.
+- 내용 중 `androidboot.mode=charger`를 `androidboot.mode=unknown`으로 바꾼 shadow file을 `/dev` 아래 만든다.
+- shadow file을 원래 proc file 위에 bind mount한다.
+- Magisk와 Android init은 shadowed proc file을 읽는다.
+```
+
+패치의 핵심은 다음과 같다:
+
+```
+changed |= tabactive3_replace_all(str, "androidboot.mode=charger", "androidboot.mode=unknown");
+...
+if (xmount(shadow, target, nullptr, MS_BIND, nullptr) != 0) {
+    PLOGE("TabActive3 autoboot: bind mount %s over %s", shadow, target);
+    return content;
+}
+```
+
+아, 또한 이 버전에서는 10초간의 Debounce Logic을 임의로 추가했던 부분을 제거했다. 아니 원래도 Charger Mode에서 Kernel을 불러오는 시간은 (최소한 한국인식 속도 개념으로는) 아주 답답하기 짝이 없기 때문이다. 아니 바빠 죽겠는데 언제 10초를 세고 있는가? 최소한 내 차에 있는 인포테인먼트가 그렇게 행동한다면 그것은 제거 대상 1순위이다. 
+
+
+#### 결과: 성공한 부분과 실패한 부분
+
+
+USB 전원 인가 후 화면상으로는 회색 글씨의 배터리 로딩 직후 Samsung 로고로 넘어갔다. Android property도 다음처럼 정상 boot에 가까워졌다.
+
+
+```
+ro.boot.mode = unknown
+ro.bootmode = unknown
+sys.boot_completed = 1
+/proc/cmdline contains androidboot.mode=unknown
+```
+
+
+그런데도, 여전히 터치와 S펜이 동작하지 않았다. 수집 스냅샷 기준으로는:
+
+```
+boot sha256 = 1023780bb4401b2563d76c15fe89cb45d111e7816c69642cc753be7cf70aaa4c
+ro.boot.mode = unknown
+ro.bootmode = unknown
+sys.boot_completed = 1
+sec_touchscreen = absent
+sec_touchpad = absent
+sec_e-pen = absent
+/sys/class/sec/tsp = absent
+/sys/bus/spi/drivers/himax_tp = absent
+```
+
+반면 같은 버전 4의 이미지에서 ADB reboot를 시도하자, 거기서 올라온 normal reboot session에서는 너무 당연하게도 touch와 pen이 존재했고 정상적으로 기능했다. 이 차이는 문제가 SystemUI나 launcher가 아니라 kernel input device registration 단계에 있음을 의미했다.
+
+
+#### 결정적 관찰?
+
+```
+/proc/cmdline: androidboot.mode=unknown
+device tree chosen bootargs: androidboot.mode=charger
+```
+
+즉 Magiskinit이 userspace-visible proc file은 바꿨지만, kernel이 boot 초기에 이미 읽었거나 보관한 원본 bootargs는 바뀌지 않았다. touch/pen driver가 kernel 내부의 LPM flag를 보고 skip된다면 해당 버전의 방식만으로는 너무 늦게 동작해서 의도대로 동작하지 않는 것이다.
+
+
+
+### Version 5: 워크어라운드.
+
+#### 가설 및 구현
+
+
+난 여기서 약간의 머리를 쓰기로 했다. 나는 방금 이 방식으로 부팅을 시도하면 터치 드라이버를 정상적으로 불러오지 않지만, 최소한 Android의 핵심 기능은 정상적으로 올라온다는 사실을 알았지. 그리고 거기서 재부팅을 하면 원래 Android 정상 부팅 상태로 다시 올라올 수 있다는 사실도 알고 있다.
+
+
+잠깐, 그렇다면 이렇게 '나사 빠진' 부팅을 한번 시킨 뒤, 그것이 완료되지마자 정상 재부팅을 강제로 수행해버리면 되잖아? Android가 충분히 일찍 뜬 직후 정상 reboot를 한 번 요청하면, 두 번째 boot는 normal reboot reason으로 들어와 touch/pen이 정상 등록될 것이다.
+
+
+물론 나도 알고 있다. 이것은 근본적으로 드라이버를 Charger 모드에서 불러오고자 하는 시도는 아니다. 그렇지만 일단 작동하게 하는 것도 나쁘지 않다고 생각했다. charger-origin을 감지하면 750 ms 뒤 다음 명령을 실행했다.
+
+```
+setprop sys.powerctl reboot,tabactive3-autoboot-v5
+```
+
+
+charger-origin signal은 userspace shadow가 아니라 device tree chosen bootargs를 읽어 판별했다.
+
+
+```
+/sys/firmware/devicetree/base/chosen/bootargs contains androidboot.mode=charger
+```
+
+반복 reboot를 막기 위해 guard file을 사용했다.
+
+```
+/cache/lpm/tabactive3-v5-autoreboot.done
+```
+
+
+당연히 이것은 매우 훌륭한 Fallback이었고 매우 정상적으로 동작했다. 그렇지만 알다시피 한국인들의 시간관념상 부팅이 될 때까지 기다리고 한번 더 재부팅을 하는 과정을 또 기다리는 것은 너무나도 고통스럽다. 특히 내 성질머리가 아주 급하다는 것이 중요했다. 뭐.. 차를 예열할 떄까지 켜진다 라고 생각하면 이해는 되는 부분이겠지만, 그는 루팅이 된 태블릿에서 부팅 전 쓸데없는 경고문을 한번 더 봐야 하고 그것을 스킵할려면 전원 버튼을 결국 수동으로 눌러줘야 한다는 사실에서 생각이 바뀌엇다. 
+
+
+본 해결책은
+
+- 너무 당연하게도, Android 시스템의 boot가 두 번 일어난다.
+- unlocked/custom warning이 두 번 보이며 난 이것이 아주 불쾌했다.
+- 차량 시동 후 usable UI까지 시간이 (아주 많이) 늘어난다.
+- 문제의 root cause를 해결한 것이 아니라 normal reboot로 회피한 것이다.
+
+
+이 때문에 다음 버전에서는 다시 kernel root cause를 찾기로 시도했다.
