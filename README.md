@@ -384,3 +384,220 @@ charger-origin signal은 userspace shadow가 아니라 device tree chosen bootar
 
 
 이 때문에 다음 버전에서는 다시 kernel root cause를 찾기로 시도했다.
+
+
+
+## 커널의 Root Cause 분석
+
+
+Android property와 `/proc/cmdline`은 normal-like인데 왜 touch가 죽는가?
+
+
+가능성은 세 가지였다.
+
+1. Android InputDispatcher나 SystemUI가 touch를 막는다.
+2. vendor service가 charger-origin을 보고 input device를 disable한다.
+3. kernel built-in driver가 boot 초기에 LPM이면 아예 등록하지 않는다.
+
+실제 증거는 3번을 가리켰다.
+
+
+### 입력 장치의 존재 여부?
+
+
+4번째 버전의 실패 스냅샷에는 `/proc/bus/input/devices`에 `sec_touchscreen`, `sec_touchpad`, `sec_e-pen`이 없었다. `/sys/class/sec/tsp`도 없었다. 이것은 단순히 UI가 입력을 무시하는 상황이 아니라 아예 처음부터 input device가 등록되지 않은 상황이다.
+
+한편, 노멀 부트 스냅샷에는 다음이 존재했다.
+
+
+```
+N: Name="sec_touchscreen"
+S: Sysfs=/devices/platform/13ae0000.spi/spi_master/spi21/spi21.0/input/input1
+H: Handlers=event1
+
+N: Name="sec_touchpad"
+H: Handlers=event2
+
+N: Name="sec_e-pen"
+S: Sysfs=/devices/platform/10910000.hsi2c/i2c-7/7-0056/input/input3
+H: Handlers=event3
+```
+
+`last_lpm.log`에는 Samsung LPM이 touch/pen sysfs를 찾지 못하는 로그가 반복됐다.
+
+```
+LPM Start
+LPM-SET setInputDeviceLpmMode
+LPM-Input No /sys/class/sec/tsp/input/enabled
+LPM-Input No /sys/class/sec/sec_epen/input/enabled
+KERNEL DRIVER MODULE has loaded!!! count 0
+```
+
+이는 LPM userspace가 touch를 꺼서 문제가 생긴 것이 아니라, 애초에 해당 sysfs가 만들어지지 않았음을 보여준다.
+
+
+그리고.. 무엇보다도 결정적으로, 커널 Image에서 다음 문자열을 찾았다.
+
+
+
+```
+[HXTP][ERROR] %s %s: Do not load driver due to : lpm %d
+himax_common_init
+%s: %s: Do not load driver due to : lpm %d
+wacom_i2c_init
+lpcharge
+bootmode_setup
+```
+
+그니까, 대놓고 'LPM 부트' 이기 떄문에 himax 터치패드 드라이버와 와콤 드라이버를 안 불러오겠다는 것이다. 
+
+
+### 디스어셈블리
+
+Init Wrapper를 디스어셈블리하여 관찰하기로 했다. 
+
+
+
+다음 함수가 `androidboot.mode` 값을 `"charger"` 문자열과 비교하고, 일치하면 전역 lpcharge를 1로 저장했다.
+
+```
+0xb1a85c:
+  compare boot mode with "charger"
+  if equal:
+      w2 = 1
+      store w2 to lpcharge_global
+  print "Low power charging mode: %d"
+```
+
+해석하면, Boot Mode를 "charger" 변수와 비교하겠다는 것이다. 만약 같으면 w2 의 값을 '1' 로 지정하고, 그 1을 'lpcharge_global' 에 저장한다는 것이다. 즉 '사람 말로' 번역하면 충전기로 부팅 시 충전 상태 플래그를 1로 저장한다는 개념이다. 
+
+
+Himax 에서는
+
+```
+0x14d0454:
+  ldr w8, [lpcharge_global] 
+  cmp w8, #0x1
+  b.ne normal_himax_init
+  print "Do not load driver due to : lpm"
+  return -19
+```
+
+w8 레지스터의 값을 앞서 설명한 lpcharge_global과 비교한다. 앞서 설명했듯 이것이 1일 경우 충전 모드이고 0일 경우 충전 모드가 아니다.
+이것을 '1' 이라는 값과 비교하고, 이것이 1이 아닐 경우 (= 충전 모드가 아닐 경우) himax 드라이버 init 코드로 분기한다.
+
+
+와콤 드라이버 에서는
+
+
+```
+0x14d04e8:
+  ldr w3, [lpcharge_global]
+  cbz w3, normal_wacom_init
+  print "Do not load driver due to : lpm"
+  return 0
+```
+동일하다. w3 레지스터의 값을 앞서 설명한 lpcharge_global과 비교한다. 앞서 설명했듯 이것이 1일 경우 충전 모드이고 0일 경우 충전 모드가 아니다. c
+
+
+아.. cbz라는 명령이 뭔지 몰라 검색해봤다. ARM64 어셈블리 인스트럭션에서 이것은 비교해서 0일경우 분기하란 뜻이란다.
+즉 w3이 0이라면 (= 충전 모드가 아닐 경우) 와콤 드라이버 init 코드로 분기한다. 
+
+
+이쯤 되면 정답이 어느 정도 나온 것으로 보인다.
+
+
+
+## 최종 시도
+
+### 가설 및 시도
+
+touch/pen driver를 각각 patch하는 것은 내 능력 밖이고, 복잡할 것이라고 판단했다. 그러나 본 어셈블리 코드를 본다면 해결책은 아주 간단해 보인다. 그 driver들이 공통으로 보는 `lpcharge` global flag가 처음부터 0으로 남게 하도록 패치를 '낑겨 넣으면' 된다.
+
+
+charger-origin boot라는 사실은 bootloader/DT bootargs에 남아도 크게 상관이 없을 것이다. 다른 안드로이드 시스템의 동작에 잇어서 이것은 큰 영향을 끼치지 않는 것 같다. 그러나 kernel의 low-power-charging policy flag가 0이면 Himax와 Wacom init은 normal path를 탄다.
+
+
+커널 raw Image offset `0xb1a884`의 ARM64 명령 한 개를 바꿨다.
+
+
+```
+original bytes: e2030032
+original asm:   orr w2, wzr, #0x1
+
+patched bytes:  e2031f2a
+patched asm:    mov w2, wzr
+```
+
+ARM64에서 wzr은, 항상 0인 zero register이다. 즉 오리지널 명령은 "W2의 값을 0과 1로 OR 연산한다" 라면, 패치한 명령의 의미는 "W2를 0으로 설정해 버린다" 라는 의미 되시겠다.
+
+
+이 결과 정상 동작이 성공하였으며, Flash 후 동작은 매우 원할하게 작동했다.  실제 bootloader 입력은 charger-origin 그대로인데, Android userspace는 normal-like로 보고, kernel driver도 `lpcharge=0` 때문에 LPM skip path로 빠지지 않는다.
+
+
+
+## 장기 안정성 검증?
+
+
+이 좁고 간단한 바이너리 패치로 우리는 모든 문제를 해결한 것처럼 보였으나, 실제로는 아직 안정성 테스트를 해야 할 부분이 많이 남아있을 것이다. 특히 다음과 같은 상황 말이다...
+
+
+1. 배터리 잔량이 낮을 때 USB insertion boot.
+2. 충전기가 약하거나 차량 전원이 순간적으로 흔들릴 때.
+3. 완전 방전 근처에서 부팅 시도.
+4. 여러 번 반복한 power-off -> USB insertion cycle.
+5. boot 후 장시간 충전 중 발열 관리.
+6. sleep/wake, screen off charging, cable unplug behavior.
+7. ETC...
+
+일단 1-3의의 경우, 배터리가 부족할 떄 전원이 켜졌다 꺼졋다를 빠르게 반복하나, 충전기의 성능이 괜찮은 것을 사용할 경우 안정적으로 부팅하여 충전이 가능했다. 나머지는 추후 검증해 나갈 것이지만, 일단 지금까지로써는 Green Flag이다.
+
+
+## 롤백
+
+이 프로젝트는 `boot` partition만 수정했다. 따라서 Download Mode와 Odin AP slot으로 기존 boot-only tar를 다시 넣는 rollback 전략이 유지된다. `param`, `up_param`, bootloader, vbmeta는 건드리지 않았다.
+
+
+## 추후 다른 기기에 이 방식을 적용한다면??
+
+비슷한 버전을 가진 삼성 루트 디바이스에 적용하는 절차라면,
+
+1. 현재 boot partition을 반드시 dump하고 hash를 기록한다.
+2. 대상 firmware build와 bootloader revision을 기록한다.
+3. Magisk version을 고정한다.
+4. power-off USB insertion boot에서 `/proc/cmdline`, DT chosen bootargs, `getprop ro.bootmode`를 수집한다.
+5. touch/pen/input device가 charger-origin boot에서 빠지는지 확인한다.
+6. kernel config에서 input driver가 module인지 built-in인지 확인한다.
+7. kernel Image strings에서 다음 류의 문구를 찾는다.
+
+```text
+Do not load driver due to : lpm
+lpcharge
+bootmode_setup
+charger
+```
+
+8. 해당 문자열을 참조하는 init wrapper를 disassemble한다.
+9. driver별 skip branch를 patch할지, 공통 `lpcharge` setter를 patch할지 결정한다.
+10. boot image를 repack하고 fresh unpack으로 hash와 bytes를 검증한다.
+11. Odin AP boot-only tar를 만든다.
+12. 첫 boot 후 ADB로 input device와 sysfs를 검증한다.
+
+
+
+이 방법은 Bootloader Unlock이 된 기기에 한정해서 동작하며, Magisk Root 또는 Boot Image Repack이 가능한 기기에서 동작한다. 
+
+
+## 적용 방법
+
+boot.img를 odin에서 설치한다. 반드시 다른 파일을 지워놓고, 일반적인 표준 ODIN 사용법을 따른다. Re-partition 설정이 '반드시 꺼져 있는지' 확인할 것.
+
+
+`0xb1a884` offset은 `SM-T575N / T575NKOSFEYI1`의 이 boot image에만 맞는다. 다른 펌웨어, 다른 모델, 심지어 같은 모델의 다른 보안 패치 레벨에도 그대로 쓰면 안 된다.
+
+
+다른 기기에 적용할 때는 "같은 의미의 코드"를 새로 찾아야 한다. offset을 복사하는 것이 아니라 분석 절차를 복사해야 한다.
+
+
+나는 이 이미지로 인해 발생하는 손상에 대해 책임지지 않을 것이며 모든 행위의 책임은 본인에게 있다. 그렇지만 해당 조건이 갖춰진 태블릿에서 boot.img 수정은 상대적으로 안전한 방식으로 생각하고 있다.
+
